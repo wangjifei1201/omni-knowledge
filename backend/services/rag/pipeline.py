@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import AsyncGenerator, Optional
 
+import jieba
 from core.config import get_settings
 from loguru import logger
 from services.llm.embedding import embedding_service
@@ -124,7 +125,7 @@ class RAGPipeline:
     async def classify_intent(self, query: str) -> IntentType:
         """Classify user query intent using LLM"""
         logger.info(f"Classifying intent for query: {query}")
-        
+
         # Quick keyword-based classification first
         metadata_keywords = [
             "多少",
@@ -262,6 +263,113 @@ class RAGPipeline:
                 reranked_results.append(result)
 
         return reranked_results[:top_k]
+
+    async def _retrieve_by_mode(
+        self,
+        query: str,
+        search_mode: str,
+        doc_scope: list[str] = None,
+        top_k: int = 10,
+    ) -> list[RetrievalResult]:
+        """Select retrieval method based on search_mode
+
+        Args:
+            query: Search query
+            search_mode: One of "hybrid", "semantic", "keyword"
+            doc_scope: Optional list of doc_ids to filter
+            top_k: Number of results to return
+
+        Returns:
+            List of retrieval results
+        """
+        filters = {}
+        if doc_scope:
+            filters["doc_ids"] = doc_scope
+
+        if search_mode == "semantic":
+            # Pure semantic/vector search without reranking
+            return await self.vector_search(query, top_k=top_k, filters=filters)
+        elif search_mode == "keyword":
+            # Keyword-based search using text matching
+            return await self.keyword_search(query, top_k=top_k, filters=filters)
+        else:
+            # Default to hybrid (vector + rerank)
+            return await self.hybrid_retrieve(query, top_k=top_k, doc_scope=doc_scope)
+
+    async def keyword_search(
+        self,
+        query: str,
+        top_k: int = 10,
+        filters: dict = None,
+    ) -> list[RetrievalResult]:
+        """Keyword-based search using jieba tokenization
+
+        Uses jieba for Chinese text segmentation and keyword matching.
+        """
+        await self.initialize()
+
+        # Get all chunks from vector store metadata
+        all_metadata = faiss_vector_store._metadata
+
+        if not all_metadata:
+            return []
+
+        # Use jieba to tokenize query, filter out stopwords and short tokens
+        query_tokens = list(jieba.cut_for_search(query))
+        # Filter: keep tokens with length >= 2 to remove single chars and punctuation
+        query_terms = set(t.lower() for t in query_tokens if len(t) >= 2)
+
+        if not query_terms:
+            # Fallback to original query if no valid tokens
+            query_terms = {query.lower()}
+
+        logger.debug(f"Keyword search terms: {query_terms}")
+
+        # Score each chunk based on keyword matches
+        scored_results = []
+        for chunk_id, metadata in all_metadata.items():
+            # Apply filters
+            if filters:
+                doc_ids = filters.get("doc_ids")
+                if doc_ids and metadata.get("doc_id") not in doc_ids:
+                    continue
+
+            content = metadata.get("content", "").lower()
+
+            # Calculate keyword match score with term frequency
+            match_count = 0
+            for term in query_terms:
+                # Count occurrences of each term
+                count = content.count(term)
+                if count > 0:
+                    match_count += min(count, 3)  # Cap at 3 to avoid over-weighting
+
+            if match_count > 0:
+                # Normalize score by query terms count
+                score = match_count / (len(query_terms) * 3)
+                scored_results.append((chunk_id, metadata, score))
+
+        # Sort by score descending
+        scored_results.sort(key=lambda x: x[2], reverse=True)
+
+        # Convert to RetrievalResult
+        results = []
+        for chunk_id, metadata, score in scored_results[:top_k]:
+            results.append(
+                RetrievalResult(
+                    chunk_id=chunk_id,
+                    doc_id=metadata.get("doc_id", ""),
+                    doc_name=metadata.get("doc_name", ""),
+                    chapter=metadata.get("chapter", ""),
+                    section=metadata.get("section", ""),
+                    page=metadata.get("page", 0),
+                    content=metadata.get("content", ""),
+                    score=score,
+                    position=metadata.get("position", {}),
+                )
+            )
+
+        return results
 
     async def hybrid_retrieve(
         self,
@@ -472,7 +580,7 @@ class RAGPipeline:
         """Full RAG pipeline execution"""
         await self.initialize()
 
-        logger.info(f"Processing query: {query}")
+        logger.info(f"Processing query: {query}, search_mode: {search_mode}")
 
         # 1. Intent classification
         intent = await self.classify_intent(query)
@@ -490,9 +598,9 @@ class RAGPipeline:
                 confidence=0.85,
             )
 
-        # Content or hybrid query
-        results = await self.hybrid_retrieve(rewritten_query, doc_scope=doc_scope)
-        logger.info(f"Retrieved {len(results)} results")
+        # Content or hybrid query - use search_mode to select retrieval method
+        results = await self._retrieve_by_mode(rewritten_query, search_mode, doc_scope)
+        logger.info(f"Retrieved {len(results)} results using {search_mode} mode")
 
         # Generate answer
         response = await self.generate_answer(rewritten_query, results, detail_level)
@@ -509,13 +617,13 @@ class RAGPipeline:
         history: list[dict] = None,
     ) -> tuple[AsyncGenerator[str, None], list[RetrievalResult], IntentType]:
         """Streaming RAG pipeline execution
-        
+
         Returns:
             tuple: (stream generator, retrieval results, intent type)
         """
         await self.initialize()
 
-        logger.info(f"Processing streaming query: {query}")
+        logger.info(f"Processing streaming query: {query}, search_mode: {search_mode}")
 
         # 1. Intent classification (quick)
         intent = await self.classify_intent(query)
@@ -523,16 +631,18 @@ class RAGPipeline:
 
         # 2. Handle METADATA intent - no retrieval needed
         if intent == IntentType.METADATA:
+
             async def metadata_stream():
                 yield "您的问题涉及文档统计信息，请查看文档管理页面获取详细统计数据。"
+
             return metadata_stream(), [], intent
 
         # 3. Query rewriting
         rewritten_query = await self.rewrite_query(query, history)
 
-        # 4. Retrieve
-        results = await self.hybrid_retrieve(rewritten_query, doc_scope=doc_scope)
-        logger.info(f"Retrieved {len(results)} results for streaming")
+        # 4. Retrieve - use search_mode to select retrieval method
+        results = await self._retrieve_by_mode(rewritten_query, search_mode, doc_scope)
+        logger.info(f"Retrieved {len(results)} results for streaming using {search_mode} mode")
 
         # 5. Return stream generator and results for citation extraction later
         stream = self.generate_answer_stream(rewritten_query, results, detail_level)
